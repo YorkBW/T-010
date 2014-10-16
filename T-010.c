@@ -1,8 +1,10 @@
 /*
  * T_010.c
+ * Firmware for rocket data bug "T-010"
+ * ArtSimMagic Inc. dba AviRoc
  *
  * Created: 9/6/2014 4:20:24 PM
- *  Author: Brent
+ *  Author: Brent W. York
  */ 
 
 
@@ -17,19 +19,22 @@
 #include <util/delay.h>
 
 
-// General configuration
-#define USB_CONNECTED_PORT_IN	PINB
-#define USB_CONNECTED_PIN_IN	PINB2
-#define USB_CONNECTED			(USB_CONNECTED_PORT_IN & _BV(USB_CONNECTED_PIN_IN))
+//-------------------------
+//  GENERAL CONFIGURATION
+//-------------------------
+	// Define USING_MPL3115 if the newer chip is present;
+	//  else MPL115 is assumed
+//#define USING_MPL3115	1
+	// Data loop times in milliseconds
+#define DATA_TICK              50
+#define HEARTBEAT_TICK       2000
+#define HEARTBEAT_ON_TIME     100
+#define HEARTBEAT_FULL_TIME   500
 
-// times in milliseconds
-#define DATA_TICK            50
-#define HEARTBEAT_TICK     2000
-#define HEARTBEAT_ON_TIME   100
 
-
-// I2C device definitions
-//const uint8_t INA219_DEVICE       = 0x40 << 1;
+//-----------------------------
+//  I2C INTERFACE DEFINITIONS
+//-----------------------------
 const uint8_t MPL115A2_DEVICE        = 0xC0;
 const uint8_t MPL115A2_READPRESMSB   = 0x00;
 const uint8_t MPL115A2_READPRESLSB   = 0x01;
@@ -40,90 +45,71 @@ const uint8_t MPL115A2_READCOEFLAST  = 0x0B;
 const uint8_t MPL115A2_STARTCONV     = 0x12;
 
 
+//-----------------------------
+//  SPI INTERFACE DEFINITIONS
+//-----------------------------
+const uint16_t FLASH_JEDEC_ID = 0x0140;
 
-// SPI device definitions
-const int ALTCOR = 192;	// sealevel altitude correction (in mb * 10)
+const uint8_t FLASH_PAGE_PGM_CMD     = 0x02;
+const uint8_t FLASH_READ_SR1_CMD     = 0x05;
+const uint8_t FLASH_WRITE_ENABLE_CMD = 0x06;
+const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
 
-// USB interface definitions
+#define FLASH_CS_SET  (PORTB &= !_BV(PORTB4))		// set chip select (low is set)
+#define FLASH_CS_CLR  (PORTB |= _BV(PORTB4))		// clear chip select (high is clear)
+
+
+//-----------------------------
+//  USB INTERFACE DEFINITIONS
+//-----------------------------
+	// USB messages from host
 #define USB_STATUS    0
 #define USB_DATA_DUMP 1
 #define USB_PRESSURE  2
+	// USB register configuration
+	// Configures USI to 3-wire master mode with overflow interrupt
+#define myUSICR  (_BV(USIWM0) | _BV(USICS1) | _BV(USICLK))
+	// USB connection detection
+#define USB_CONNECTED_PORT_IN	PINB
+#define USB_CONNECTED_PIN_IN	PINB2
+#define USB_CONNECTED			(USB_CONNECTED_PORT_IN & _BV(USB_CONNECTED_PIN_IN))
 
 
-// Global variables
+//--------------------
+//  GLOBAL VARIABLES
+//--------------------
+	// General purpose data buffer
 #define DATA_BUF_SZ 16
 static uchar dataBuf[DATA_BUF_SZ];
 
-uchar myUSICR;
-
+	// Status byte
 #define DEV_GOOD_MPL115A2		0
-//#define DEV_GOOD_SCP1000	1
-uchar devicesGood;
+#define DEV_GOOD_FLASH			1
+uchar deviceStatus;
 
+	// MPL115A2 coefficients
 int16_t a0, b1, b2, c12;
-int16_t lastPres;
+
+	// Flash memory
+uint16_t flashSize;			// size in 256-byte pages
+uint16_t flashStartPage;	// starting write page
+uint16_t flashPage;			// current write page indicator
+uint8_t flashByteCtr;		// current write byte counter within page
 
 
-// TEMP: Forward function declarations
-void startMPL115A2Read(void);
-int16_t readMPL115A2Pressure(void);
-
-
-// -------------------------
-//  USB interface functions
-// -------------------------
-
-USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
-// Responds to USB messages
-{
-	//int temp;
-	//uint16_t utemp;
-	
-	usbRequest_t *rq = (void *)data; // cast data to correct type
-	
-	switch(rq->bRequest) { // custom command is in the bRequest field
-
-		case USB_STATUS:
-			usbMsgPtr = (usbMsgPtr_t)(&devicesGood);
-			return 1;
-
-		case USB_DATA_DUMP: // send data to PC
-			usbMsgPtr = (usbMsgPtr_t)dataBuf;
-			return DATA_BUF_SZ;
-
-		case USB_PRESSURE:
-			startMPL115A2Read();
-			_delay_ms(3);
-			lastPres = readMPL115A2Pressure();
-			usbMsgPtr = (usbMsgPtr_t)(&lastPres);
-			return sizeof(lastPres);
-
-/*
-		case USB_DATA_WRITE: // modify reply buffer
-			replyBuf[7] = rq->wValue.bytes[0];
-			replyBuf[8] = rq->wValue.bytes[1];
-			replyBuf[9] = rq->wIndex.bytes[0];
-			replyBuf[10] = rq->wIndex.bytes[1];
-			return 0;
-*/
- 	}
-
-	return 0; // unhandled message
-}
-
-// ----------------------
-//  I2C device functions
-// ----------------------
+//---------------------------
+//  I2C INTERFACE FUNCTIONS
+//---------------------------
 
 uint8_t initMPL115A2(void)
 // Initialize the MPL115A2 pressure sensor, return 0 if bad comms
 {
 	uchar coef;
 	
-// Init comms
+	// Init comms
 	if (i2c_start(MPL115A2_DEVICE | I2C_WRITE) != 0) return 0;
 	
-// Read coefficients
+	// Read coefficients
 	i2c_write(MPL115A2_READCOEFFIRST);
 	i2c_rep_start(MPL115A2_DEVICE | I2C_READ);
 	for (coef=MPL115A2_READCOEFFIRST; coef<=MPL115A2_READCOEFLAST; coef++) {
@@ -176,10 +162,10 @@ int16_t readMPL115A2Pressure(void)
 
 
 
-// ----------------------
-//  SPI device functions
-// ----------------------
-#if 0
+//---------------------------
+//  SPI INTERFACE FUNCTIONS
+//---------------------------
+
 uint8_t spiByte(uint8_t data)
 // SPI write / read one byte
 {
@@ -193,66 +179,171 @@ uint8_t spiByte(uint8_t data)
 	return USIDR;
 }
 
-void SCPWriteReg(uint8_t reg, uint8_t val)
-// Write a register for SCP1000
+
+uint8_t initFlash(void)
+// Initialize the S25FL1--K Flash chip, return 0 if bad comms
 {
-	reg <<= 2;
-	reg |= 2;
-	PORTB &= !_BV(PORTB4);			// set chip select (low is set)
-	spiByte(reg);	spiByte(val);	PORTB |= _BV(PORTB4);			// clear chip select (high is clear)
-}
-uint8_t SCPReadReg8(uint8_t reg)// Read an 8-bit register for SCP1000
-{	uint8_t retVal;		reg <<= 2;
-	reg &= 0xfc;
-	PORTB &= !_BV(PORTB4);			// set chip select (low is set)
-	spiByte(reg);	retVal = spiByte(0);	PORTB |= _BV(PORTB4);			// clear chip select (high is clear)
-	
-	return retVal;
-}uint16_t SCPReadReg16(uint8_t reg)// Read a 16-bit register for SCP1000
-{	uint16_t retVal;		reg <<= 2;
-	reg &= 0xfc;
-	PORTB &= !_BV(PORTB4);			// set chip select (low is set)
-	spiByte(reg);	retVal = (spiByte(0) << 8) | spiByte(0);	PORTB |= _BV(PORTB4);			// clear chip select (high is clear)
-	
-	return retVal;
-}
-uint8_t initSCP1000(void)
-// Initialize the SCP1000 device, return 0 if bad comms
-{
-	SCPWriteReg(3, 0x0a);	// select high-precision mode//	SCPReadReg8(0x1f);		// dummy read of pressure register to clear DRDY//	SCPReadReg16(0x20);
+	uint16_t id;
+	uint8_t sz;
+
+	// Verify device ID
+	FLASH_CS_SET;
+	spiByte(FLASH_JEDEC_ID_CMD);
+	id = (spiByte(0) << 8) | spiByte(0);	if (id != FLASH_JEDEC_ID) return 0;	
+	// Read flash size
+	sz = spiByte(0) - 0x14;
+	deviceStatus = (deviceStatus & 0x3F) | (sz << 6);
+	flashSize = sz * 2;
+	if (flashSize == 6) flashSize = 8;
+	flashSize *= 4096;
+
+	FLASH_CS_CLR;	
 	return 1;	// device good
 }
 
-uint16_t readSCPPressure(void)
-// Read pressure from SCP1000 in 10s of mbar
-{
-	/*uint8_t status;*/
-	uint8_t presH;
-	uint16_t pres;
-	
-    /*status =*/ SCPReadReg8(0x07);						// read status register    presH = SCPReadReg8(0x1f);                  // read pressure register (high bits)    presH &= 0x07;                              // only lower 3 bits are significant	pres = presH;	pres <<= 13;    pres |= SCPReadReg16(0x20) >> 3;                // read lower bits of pressure (in mb * 10)	pres /= 5;    pres += ALTCOR;		return pres;}
 
-int readSCPTemperature(void)
-// Read temperature from SCP1000 in 1/100 deg F
+uint8_t isFlashBusy(void)
+// Check status register to see if device is busy, returns 1 if busy or 0 if ready
 {
-	/*uint8_t status;*/
-	uint16_t rawtemp;
-	int TempC, TempF;
+	uint8_t ret;
 	
-	/*status =*/ SCPReadReg8(0x07);						// read status register	rawtemp = SCPReadReg16(0x21);            // read temperature register		TempC = rawtemp * 10 / 2;                // compute temperature in °C x 100	TempF = TempC * 9 / 5 + 3200;		return TempF;}
-#endif
+	// Read status register 1
+	FLASH_CS_SET;
+	spiByte(FLASH_READ_SR1_CMD);
+	ret = spiByte(0)&1;
+	FLASH_CS_CLR;
+	
+	// Return bit 0
+	return ret;
+}
 
-// --------------
-//  Main program
-// --------------
+
+void waitForFlashReady(void)
+// Waits until device status indicates ready to accept commands
+{
+	// Read status register 1
+	FLASH_CS_SET;
+	spiByte(FLASH_READ_SR1_CMD);
+	while (spiByte(0)&1)
+		;
+	FLASH_CS_CLR;
+}
+
+
+void startFlashWritePage(uint16_t page)
+// Opens a flash memory page for writing. Called automatically for sequential writes.
+{
+	FLASH_CS_SET;
+	spiByte(FLASH_WRITE_ENABLE_CMD);
+	FLASH_CS_CLR;
+	_delay_us(20); // TODO: check length of delay
+	
+	FLASH_CS_SET;
+	spiByte(FLASH_PAGE_PGM_CMD);
+	spiByte(page >> 8);
+	spiByte(page & 0xFF);
+	spiByte(0);
+}
+
+
+void startFlashWrite(uint16_t page)
+// Begins a flash memory sequential write.
+{
+	flashPage = page;
+	flashStartPage = page;
+	flashByteCtr = 0;
+	startFlashWritePage(page);
+}
+
+
+uint8_t writeFlashByte(uint8_t b)
+// Writes bytes sequentially to the flash memory.
+// Must have called startFlashWrite() before calling this function.
+// Returns 1 if we just filled the last memory page; 0 if all OK.
+{
+	spiByte(b);
+	if (flashByteCtr++ == 0) {
+		FLASH_CS_CLR;
+		waitForFlashReady();
+		flashPage++;
+		if (flashPage > flashSize) flashPage = 0;
+		if (flashPage == flashStartPage) return 1;
+		startFlashWritePage(flashPage);
+	}
+	return 0;
+}
+
+
+void endFlashWrite(void)
+// Ends a flash memory sequential write.
+{
+	FLASH_CS_CLR;
+}
+
+
+
+
+//---------------------------
+//  USB INTERFACE FUNCTIONS
+//---------------------------
+
+USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
+// Responds to USB messages
+{
+	//int temp;
+	//uint16_t utemp;
+	int16_t pressure;
+	
+	usbRequest_t *rq = (usbRequest_t *)data;
+	
+	// Respond to command in bRequest field
+	switch(rq->bRequest) {
+
+		case USB_STATUS:
+			usbMsgPtr = (usbMsgPtr_t)(&deviceStatus);
+			return 1;
+
+		case USB_DATA_DUMP: // send data to PC
+			usbMsgPtr = (usbMsgPtr_t)dataBuf;
+			return DATA_BUF_SZ;
+
+		case USB_PRESSURE:
+			startMPL115A2Read();
+			_delay_ms(3);
+			pressure = readMPL115A2Pressure();
+			usbMsgPtr = (usbMsgPtr_t)(&pressure);
+			return sizeof(pressure);
+
+/*
+		case USB_DATA_WRITE: // modify reply buffer
+			replyBuf[7] = rq->wValue.bytes[0];
+			replyBuf[8] = rq->wValue.bytes[1];
+			replyBuf[9] = rq->wIndex.bytes[0];
+			replyBuf[10] = rq->wIndex.bytes[1];
+			return 0;
+*/
+ 	}
+
+	return 0; // unhandled message
+}
+
+
+
+//----------------
+//  MAIN PROGRAM
+//----------------
 
 int main(void)
 {
-	uchar i;
+	uchar i, memoryFull;
 	uint16_t pacifier = 0;
 	uchar usbConnected, usbConnectedLast = 0;
 	uint16_t PACIFIER_OFF_TGT = HEARTBEAT_TICK / DATA_TICK;
 	uint16_t PACIFIER_ON_TGT = PACIFIER_OFF_TGT - (HEARTBEAT_ON_TIME / DATA_TICK);
+	uint16_t PACIFIER_FULL_TGT = HEARTBEAT_FULL_TIME / DATA_TICK;
+	int16_t pressure;
+	
+#define CHECK_WRITE(b) { if (!memoryFull) memoryFull = writeFlashByte(b); }
 
 // Enable 1 sec watchdog timer
 	wdt_enable(WDTO_1S);
@@ -261,9 +352,9 @@ int main(void)
 								// PA0: Crystal
 								// PA1: Crystal
 								// PA2: !RESET
-								// PB0: spare
-								// PB1: spare
-	DDRB &= ~_BV(DDB2);			// PB2: USB connection present flag
+	// input					// PB0: Altimeter interrupt 1
+	// input					// PB1: Altimeter interrupt 2
+	// input					// PB2: USB connection present flag
 	PORTB &= ~_BV(PORTB2);		    // no pull-up
 								// PB3: reserved for MPU interrupt
 	DDRB |= _BV(DDB4);			// PB4: !CS for SPI
@@ -276,54 +367,75 @@ int main(void)
 	DDRD |= _BV(DDD1);			// PD1: SDA for I2C
 	// V-USB handles this pin	// PD2: USB+
 	// V-USB handles this pin	// PD3: USB-
-								// PD4: unused
-								// PD5: unused
+								// PD4: spare
+								// PD5: spare
 	DDRD |= _BV(DDD6);			// PD6: Status LED (output)
 
 // Initialize software I2C
 	i2c_init();
 
 // Enable SPI mode for USI (hardware SPI)
-	// Configure USI to 3-wire master mode with overflow interrupt
-	myUSICR = /*_BV(USIOIE) |*/ _BV(USIWM0) | _BV(USICS1) | /*_BV(USICS0) |*/ _BV(USICLK);
 	USICR = myUSICR;
 	
 // Initialize all bus devices
-	devicesGood = 0;
-	devicesGood |= initMPL115A2() << DEV_GOOD_MPL115A2;
-	//devicesGood |= initSCP1000() << DEV_GOOD_SCP1000;
+	deviceStatus = 0;
+	deviceStatus |= initMPL115A2() << DEV_GOOD_MPL115A2;
+	deviceStatus |= initFlash() << DEV_GOOD_FLASH;
 
 // Initialize USB
-	// CHECK whether this is working as expected for start-up when not connected to USB
+	// TODO: Check whether this is working as expected for start-up when not connected to USB
 	usbInit();
 	usbDeviceDisconnect(); // enforce re-enumeration
-	for (i=0; i<250; i++) { // wait 500 ms
-		wdt_reset(); // keep the watchdog happy
-		_delay_ms(2);
+	for (i=0; i<10; i++) { // wait 500 ms
+		wdt_reset();
+		_delay_ms(50);
 	}
 	usbDeviceConnect();
 	sei(); // Enable interrupts after re-enumeration
+	
+	memoryFull = 0;
+	startFlashWrite(0);		// temp -- starts at beginning of flash whenever turned on
+							// TODO: come up with something more intelligent...
 
 // Main loop
 	while (1) {
 		// Reset watchdog
 		wdt_reset();
 		
-		// If connected to USB, poll for messages (and keep status light on solid)
+		// If connected to USB, poll for messages (and keep status light on continuously)
 		usbConnected = USB_CONNECTED;
 		if (usbConnected) {
+			// if (!usbConnectedLast) re-enumerate?
+			PORTD |= _BV(PORTD6); // turn status LED on
 			usbPoll();
-			PORTD |= _BV(PORTD6); // light status LED
-			//if (++pacifier > 60000) PIND |= _BV(PIND6);
 		}
 		
 		// If NOT connected to USB, collect data (and flash status light as heartbeat)
 		else {
-			if (usbConnectedLast) PORTD &= ~_BV(PORTD6); // turn status LED off if just removed
-			_delay_ms(50);  // should instead wait for a clock tick, not delay a specified amount!
+			if (usbConnectedLast) PORTD &= ~_BV(PORTD6); // turn status LED off immediately if just removed
+			
+			// Read altimeter
+			startMPL115A2Read();
+			_delay_ms(3);  // maximum ADC conversion time
+			pressure = readMPL115A2Pressure();
+			
+			// Write data to flash
+			CHECK_WRITE(((uint16_t)pressure) >> 8);
+			CHECK_WRITE(((uint16_t)pressure) & 0xFF);
+
+			_delay_ms(DATA_TICK);  // should instead wait for a clock tick, not delay a specified amount!
 			
 			// Heartbeat
-			if (++pacifier > PACIFIER_ON_TGT) {
+			pacifier++;
+			if (memoryFull) {
+				// Flash quickly if the memory is filled
+				if (pacifier > PACIFIER_FULL_TGT) {
+					PIND |= _BV(PORTD6); // toggle status LED
+					pacifier = 0;
+				}
+			}
+			else if (pacifier > PACIFIER_ON_TGT) {
+				// Flash slowly for normal operation
 				if (pacifier > PACIFIER_OFF_TGT) {
 					PORTD &= ~_BV(PORTD6); // turn status LED off
 					pacifier = 0;
@@ -332,10 +444,6 @@ int main(void)
 			}
 		}
 		
-		// Read I2C device (voltage and current)
-		
-		// Read SPI device (temperature and pressure)
-
 		usbConnectedLast = usbConnected;
 	}
 	
