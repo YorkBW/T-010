@@ -14,8 +14,7 @@
 
 #define USB_STATUS				0
 #define USB_DATA_DUMP			1
-#define USB_READ_ALTITUDE		2
-#define USB_READ_TEMPERATURE	3
+#define USB_READ_ALTIMETER		2
 #define USB_CLEAR_MEMORY		4
 
 
@@ -215,28 +214,28 @@ int main(int argc, char **argv)
         nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
             USB_STATUS, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
 		debug_byte_dump(nBytes, buffer);
-		printf("Status = 0x%02x\n", buffer[0]);
-		puts("=== Device connected to USB");
-		printf("      Altimeter (MPL3115)        %s\n", BIT_TRUE(buffer[0],DEV_GOOD_MPLX115)?"OK":"BAD");
-		printf("      Flash RAM                  %s\n", BIT_TRUE(buffer[0],DEV_GOOD_FLASH)?"OK":"BAD");
-		printf("      Accelerometer (MPU-6050)   %s\n", BIT_TRUE(buffer[0],DEV_GOOD_MPU6050)?"OK":"BAD");
+		if (nBytes != 1) puts("Unexpected buffer size return!");
+		else {
+			//printf("Status = 0x%02x\n", buffer[0]);
+			puts("=== Device connected to USB");
+			printf("      Altimeter (MPL3115)        %s\n", BIT_TRUE(buffer[0],DEV_GOOD_MPLX115)?"OK":"BAD");
+			printf("      Flash RAM (S2FL1%dK)       %s\n", (buffer[0] >> 5) * 16, BIT_TRUE(buffer[0],DEV_GOOD_FLASH)?"OK":"BAD");
+			printf("      Accelerometer (MPU-6050)   %s\n", BIT_TRUE(buffer[0],DEV_GOOD_MPU6050)?"OK":"BAD");
+		}
     }
     else if (strcmp(argv[1], "read") == 0) {
         nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
-            USB_READ_ALTITUDE, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
+            USB_READ_ALTIMETER, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
 		debug_byte_dump(nBytes, buffer);
-		printf("Altitude = %d.%04d meters\n", (buffer[1] << 8) + buffer[2], BIT_TRUE(buffer[3],7)*5000 +
-			BIT_TRUE(buffer[3],6)*2500 + BIT_TRUE(buffer[3],5)*1250 + BIT_TRUE(buffer[3],4)*625);
-
-		nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
-            USB_READ_TEMPERATURE, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
-		debug_byte_dump(nBytes, buffer);
-		degC = buffer[0] + BIT_TRUE(buffer[1],7)*0.5 + BIT_TRUE(buffer[1],6)*0.25 +
-			BIT_TRUE(buffer[1],5)*0.125 + BIT_TRUE(buffer[1],4)*0.0625;
-		degF = 32. + 9 * degC / 5;
-		printf("Temperature = %.4f degC (%.4f degF)\n", degC, degF);
-//		printf("Temperature = %d.%04d degC ( degF)\n", buffer[0], BIT_TRUE(buffer[1],7)*5000 +
-//			BIT_TRUE(buffer[1],6)*2500 + BIT_TRUE(buffer[1],5)*1250 + BIT_TRUE(buffer[1],4)*625);
+		if (nBytes != 5) puts("Unexpected buffer size return!");
+		else {
+			printf("Altitude = %d.%04d meters\n", (buffer[0] << 8) + buffer[1], BIT_TRUE(buffer[2],7)*5000 +
+				BIT_TRUE(buffer[2],6)*2500 + BIT_TRUE(buffer[2],5)*1250 + BIT_TRUE(buffer[2],4)*625);
+			degC = buffer[3] + BIT_TRUE(buffer[4],7)*0.5 + BIT_TRUE(buffer[4],6)*0.25 +
+				BIT_TRUE(buffer[4],5)*0.125 + BIT_TRUE(buffer[4],4)*0.0625;
+			degF = 32. + 9 * degC / 5;
+			printf("Temperature = %.4f degC (%.4f degF)\n", degC, degF);
+		}
     }
 	else if (strcmp(argv[1], "test") == 0) {
         nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 

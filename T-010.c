@@ -38,15 +38,28 @@ Do this by executing (on a factory-fresh IC):
 #define HEARTBEAT_TICK       2000
 #define HEARTBEAT_ON_TIME     100
 #define HEARTBEAT_FULL_TIME   500
+	// Altimeter setting
+const uint8_t MPL3115A2_CFG = 0xB8;		// contents of CTRL_REG1
 
 
 //-----------------------------
 //  I2C INTERFACE DEFINITIONS
 //-----------------------------
-const uint8_t MPL3115A2_DEVICE        = 0xC0;
+const uint8_t MPL3115A2_DEVICE			= 0xC0;
+const uint8_t MPL3115A2_REG_STATUS		= 0x00;
+const uint8_t MPL3115A2_REG_OUT_P_MSB	= 0x01;
+const uint8_t MPL3115A2_REG_OUT_P_CSB	= 0x02;
+const uint8_t MPL3115A2_REG_OUT_P_LSB	= 0x03;
+const uint8_t MPL3115A2_REG_OUT_T_MSB	= 0x04;
+const uint8_t MPL3115A2_REG_OUT_T_LSB	= 0x05;
+const uint8_t MPL3115A2_REG_WHOAMI		= 0x0C;
+const uint8_t MPL3115A2_REG_PT_DATA_CFG	= 0x13;
+const uint8_t MPL3115A2_REG_CTRL_REG1	= 0x26;
+const uint8_t MPL3115A2_DEVICE_ID		= 0xC4;
 
-const uint8_t MPU6050_DEVICE		  = 0xD0;
-const uint8_t MPU6050_WHOAMI		  = 0x75;
+const uint8_t MPU6050_DEVICE		= 0xD0;
+const uint8_t MPU6050_REG_WHOAMI	= 0x75;
+const uint8_t MPU6050_DEVICE_ID		= 0x68;
 
 
 //-----------------------------
@@ -69,8 +82,7 @@ const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
 	// USB messages from host
 #define USB_STATUS				0
 #define USB_DATA_DUMP			1
-#define USB_READ_ALTITUDE		2
-#define USB_READ_TEMPERATURE	3
+#define USB_READ_ALTIMETER		2
 #define USB_CLEAR_MEMORY		4
 	// USB register configuration
 	// Configures USI to 3-wire master mode with overflow interrupt
@@ -89,10 +101,14 @@ const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
 static uchar dataBuf[DATA_BUF_SZ];
 
 	// Status byte
+#define deviceStatus			(dataBuf[0])
 #define DEV_GOOD_MPL3115		0
 #define DEV_GOOD_FLASH			1
 #define DEV_GOOD_MPU6050		2
-uchar deviceStatus;
+
+	// Altimeter data
+#define altitude_ptr			(dataBuf + 1)		// 3 bytes
+#define temperature_ptr			(dataBuf + 4)		// 2 bytes
 
 	// Flash memory
 uint16_t flashSize;			// size in 256-byte pages
@@ -100,8 +116,6 @@ uint16_t flashStartPage;	// starting write page
 uint16_t flashPage;			// current write page indicator
 uint8_t flashByteCtr;		// current write byte counter within page
 
-int32_t altitude;
-int16_t temperature;
 
 
 //---------------------------
@@ -160,22 +174,18 @@ uint8_t readMPL3115Register(uint8_t reg)
 uint8_t initMPL3115(void)
 // Initialize the MPL3115A2 pressure sensor / altimeter, return 0 if bad comms
 {
-// Set to altimeter with an OSR = 128
-	if (!writeMPL3115Register(0x26, 0xB8)) return 0;
+// Check that expected device is present
+	if (readMPL3115Register(MPL3115A2_REG_WHOAMI) != MPL3115A2_DEVICE_ID) return 0;
 
-// Set user offset altitude (TODO: make a real offset, not a test!)
-	//if (!writeMPL3115Register(0x2D, 35)) return 0;
+// Set to altimeter with an OSR = 128
+	if (!writeMPL3115Register(MPL3115A2_REG_CTRL_REG1, MPL3115A2_CFG)) return 0;
 
 // Enable data flags in PT_DATA_CFG
-	if (!writeMPL3115Register(0x13, 0x07)) return 0;
+	if (!writeMPL3115Register(MPL3115A2_REG_PT_DATA_CFG, 0x07)) return 0;
 
 // Start data collection
-	if (!writeMPL3115Register(0x26, 0xB9)) return 0;
+	if (!writeMPL3115Register(MPL3115A2_REG_CTRL_REG1, MPL3115A2_CFG | 1)) return 0;
 	
-	// TEMP device check!
-	dataBuf[1] = readMPL3115Register(0x0C);
-	dataBuf[2] = 0xFF;
-
 	return 1;	// device good
 }
 
@@ -186,78 +196,36 @@ void waitForMPL3115Ready(void)
 // TODO: Add a timeout!
 	uint8_t status;
 	do {
-		status = readMPL3115Register(0x00);
+		status = readMPL3115Register(MPL3115A2_REG_STATUS);
 	} while ((status & 0x08) == 0);
 }
 
 
-int32_t readMPL3115Altitude(void)
-// Read data from MPL3115A2 and return signed altitude including 4-bit fractional part
-//  32 bits = 0BB.B
+void readMPL3115(void)
+// Read altitude and temperature data from MPL3115A2 into data buffer
+//  Altitude:	 24 bits = BB.B  (8-bit fractional part) (meters MSL)
+//  Temperature: 12 bits =  B.B  (4-bit fractional part) (degrees C)
+// TODO: Consider one "long" 5-byte read instead of 5 separate reads!
 {
-	int32_t res = 0;
-	uint8_t *p = (uint8_t *)(&res);
+	uint8_t *p = altitude_ptr;
 	
 	waitForMPL3115Ready();
 
-	*(++p) = readMPL3115Register(0x01);
-	if (((*p) & 0x80) == 1) *(uint8_t *)(&res) = 0xFF;
-	*(++p) = readMPL3115Register(0x02);
-	*(++p) = readMPL3115Register(0x03);
-
-#if 0
-	dataBuf[3] = OUT_P_MSB;
-	dataBuf[4] = OUT_P_CSB;
-	dataBuf[5] = OUT_P_LSB;
+// Read altitude
+	*(p++) = readMPL3115Register(MPL3115A2_REG_OUT_P_MSB);
+	*(p++) = readMPL3115Register(MPL3115A2_REG_OUT_P_CSB);
+	*(p++) = readMPL3115Register(MPL3115A2_REG_OUT_P_LSB);
 	
-	dataBuf[10] = readMPL3115Register(0x04);
-	dataBuf[11] = readMPL3115Register(0x05);
-	
-	dataBuf[7] = OUT_P_MSB;
-	dataBuf[8] = OUT_P_CSB;
-	dataBuf[9] = OUT_P_LSB;
-	if (OUT_P_MSB & 0x80) {
-		dataBuf[6] = 1;
-		if (dataBuf[9]-- == 0) {
-			if (dataBuf[8]-- == 0) {
-				dataBuf[7]--;
-			}
-		}
-		dataBuf[7] = ~dataBuf[7];
-		dataBuf[8] = ~dataBuf[8];
-		dataBuf[9] = ~dataBuf[9];
-	}
-	else {
-		dataBuf[6] = 0;
-	}
-#endif
-	
-	return res;
-}
-
-
-int16_t readMPL3115Temperature(void)
-// Read data from MPL3115A2 and return signed temperature in DegC (with 4-bit fractional part)
-//  16 bits = B.B
-{
-	int16_t res;
-	uint8_t *p = (uint8_t *)(&res);
-	
-	*(p) = readMPL3115Register(0x04);
-	*(++p) = readMPL3115Register(0x05);
-
-	return res;
+// Read temperature
+	*(p++) = readMPL3115Register(MPL3115A2_REG_OUT_T_MSB);
+	*p = readMPL3115Register(MPL3115A2_REG_OUT_T_LSB);
 }
 
 
 uint8_t initMPU6050(void)
 // Initialize the MPU-6050 accelerometer, return 0 if bad comms
 {
-	uint8_t c;
-	
-	c = readI2CRegister(MPU6050_DEVICE, MPU6050_WHOAMI);
-	if (c != 0x68) return 0;
-	
+	if (readI2CRegister(MPU6050_DEVICE, MPU6050_REG_WHOAMI) != MPU6050_DEVICE_ID) return 0;
 	return 1;
 }
 
@@ -271,11 +239,11 @@ uint8_t spiByte(uint8_t data)
 // SPI write / read one byte
 {
 	USIDR = data;
-	USISR = _BV(USIOIF) /*| 0x08*/; // clear flag and set for 8 ticks
+	USISR = _BV(USIOIF);				// clear flag and set for 8 ticks
 	
 	while ((USISR & _BV(USIOIF)) == 0) {
 		//_delay_us(500);
-		USICR = myUSICR | _BV(USITC); // clock tick
+		USICR = myUSICR | _BV(USITC);	// clock tick
 	}
 	return USIDR;
 }
@@ -290,13 +258,13 @@ uint8_t initFlash(void)
 	// Verify device ID
 	FLASH_CS_SET;
 	spiByte(FLASH_JEDEC_ID_CMD);
-	id = (spiByte(0) << 8) | spiByte(0);	if (id != FLASH_JEDEC_ID) return 0;	
+	id = (spiByte(0) << 8) | spiByte(0);	if (id != FLASH_JEDEC_ID) {		FLASH_CS_CLR;
+		return 0;	}	
 	// Read flash size
 	sz = spiByte(0) - 0x14;
-	deviceStatus = (deviceStatus & 0x3F) | (sz << 6);
 	flashSize = sz * 2;
 	if (flashSize == 6) flashSize = 8;
-	flashSize *= 4096;
+	flashSize <<= 12; // * 4096
 
 	FLASH_CS_CLR;	
 	return 1;	// device good
@@ -311,7 +279,7 @@ uint8_t isFlashBusy(void)
 	// Read status register 1
 	FLASH_CS_SET;
 	spiByte(FLASH_READ_SR1_CMD);
-	ret = spiByte(0)&1;
+	ret = spiByte(0) & 1;
 	FLASH_CS_CLR;
 	
 	// Return bit 0
@@ -325,7 +293,7 @@ void waitForFlashReady(void)
 	// Read status register 1
 	FLASH_CS_SET;
 	spiByte(FLASH_READ_SR1_CMD);
-	while (spiByte(0)&1)
+	while (spiByte(0) & 1)
 		;
 	FLASH_CS_CLR;
 }
@@ -408,20 +376,14 @@ USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 			usbMsgPtr = (usbMsgPtr_t)(&deviceStatus);
 			return 1;
 
-		case USB_DATA_DUMP: // send data to PC
+		case USB_DATA_DUMP: // send all data in buffer to PC
 			usbMsgPtr = (usbMsgPtr_t)dataBuf;
 			return DATA_BUF_SZ;
 
-		case USB_READ_ALTITUDE:
-			altitude = readMPL3115Altitude();
-			usbMsgPtr = (usbMsgPtr_t)(&altitude);
-			return sizeof(altitude);
-
-		case USB_READ_TEMPERATURE:
-			temperature = readMPL3115Temperature();
-			usbMsgPtr = (usbMsgPtr_t)(&temperature);
-			return sizeof(temperature);
-
+		case USB_READ_ALTIMETER:
+			readMPL3115();
+			usbMsgPtr = (usbMsgPtr_t)(altitude_ptr);
+			return 5;
 
 /*
 		case USB_DATA_WRITE: // modify reply buffer
@@ -447,10 +409,10 @@ int main(void)
 	uchar i, memoryFull;
 	uint16_t pacifier = 0;
 	uchar usbConnected, usbConnectedLast = 0;
+	uchar *p;
 	uint16_t PACIFIER_OFF_TGT = HEARTBEAT_TICK / DATA_TICK;
 	uint16_t PACIFIER_ON_TGT = PACIFIER_OFF_TGT - (HEARTBEAT_ON_TIME / DATA_TICK);
 	uint16_t PACIFIER_FULL_TGT = HEARTBEAT_FULL_TIME / DATA_TICK;
-	int32_t altitude;
 	
 #define CHECK_WRITE(b) { if (!memoryFull) memoryFull = writeFlashByte(b); }
 
@@ -491,7 +453,7 @@ int main(void)
 	deviceStatus |= initMPL3115() << DEV_GOOD_MPL3115;
 	deviceStatus |= initFlash() << DEV_GOOD_FLASH;
 	deviceStatus |= initMPU6050() << DEV_GOOD_MPU6050;
-	dataBuf[0] = deviceStatus;
+	deviceStatus |= flashSize >> 8;		// store size of flash RAM (in MB) to top 3 bits of status byte
 
 // Initialize USB
 	// TODO: Check whether this is working as expected for start-up when not connected to USB
@@ -526,12 +488,11 @@ int main(void)
 			if (usbConnectedLast) PORTD &= ~_BV(PORTD6); // turn status LED off immediately if just removed
 			
 			// Read altimeter
-			altitude = readMPL3115Altitude();
+			readMPL3115();
 			
-			// Write data to flash
-			CHECK_WRITE(*(unsigned char *)(&altitude+1));
-			CHECK_WRITE(*(unsigned char *)(&altitude+2));
-			CHECK_WRITE(*(unsigned char *)(&altitude+3));
+			// Write data to flash (altitude and temperature)
+			p = altitude_ptr;
+			for (i=0; i<5; i++) CHECK_WRITE(*(p++));
 
 			_delay_ms(DATA_TICK);  // should instead wait for a clock tick, not delay a specified amount!
 			
