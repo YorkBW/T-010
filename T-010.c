@@ -33,9 +33,6 @@ Do this by executing (on a factory-fresh IC):
 //-------------------------
 //  GENERAL CONFIGURATION
 //-------------------------
-	// Define USING_MPL3115 if the newer chip is present;
-	//  else MPL115 is assumed
-#define USING_MPL3115	1
 	// Data loop times in milliseconds
 #define DATA_TICK              50
 #define HEARTBEAT_TICK       2000
@@ -46,14 +43,7 @@ Do this by executing (on a factory-fresh IC):
 //-----------------------------
 //  I2C INTERFACE DEFINITIONS
 //-----------------------------
-const uint8_t MPLx115A2_DEVICE        = 0xC0;
-const uint8_t MPL115A2_READPRESMSB    = 0x00;
-const uint8_t MPL115A2_READPRESLSB    = 0x01;
-const uint8_t MPL115A2_READTEMPMSB    = 0x02;
-const uint8_t MPL115A2_READTEMPLSB    = 0x03;
-const uint8_t MPL115A2_READCOEFFIRST  = 0x04;
-const uint8_t MPL115A2_READCOEFLAST   = 0x0B;
-const uint8_t MPL115A2_STARTCONV      = 0x12;
+const uint8_t MPL3115A2_DEVICE        = 0xC0;
 
 const uint8_t MPU6050_DEVICE		  = 0xD0;
 const uint8_t MPU6050_WHOAMI		  = 0x75;
@@ -69,7 +59,7 @@ const uint8_t FLASH_READ_SR1_CMD     = 0x05;
 const uint8_t FLASH_WRITE_ENABLE_CMD = 0x06;
 const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
 
-#define FLASH_CS_SET  (PORTB &= !_BV(PORTB4))		// set chip select (low is set)
+#define FLASH_CS_SET  (PORTB &= ~_BV(PORTB4))		// set chip select (low is set)
 #define FLASH_CS_CLR  (PORTB |= _BV(PORTB4))		// clear chip select (high is clear)
 
 
@@ -77,10 +67,11 @@ const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
 //  USB INTERFACE DEFINITIONS
 //-----------------------------
 	// USB messages from host
-#define USB_STATUS			0
-#define USB_DATA_DUMP		1
-#define USB_ALTITUDE		2
-#define USB_TEMPERATURE		3
+#define USB_STATUS				0
+#define USB_DATA_DUMP			1
+#define USB_READ_ALTITUDE		2
+#define USB_READ_TEMPERATURE	3
+#define USB_CLEAR_MEMORY		4
 	// USB register configuration
 	// Configures USI to 3-wire master mode with overflow interrupt
 #define myUSICR  (_BV(USIWM0) | _BV(USICS1) | _BV(USICLK))
@@ -98,21 +89,19 @@ const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
 static uchar dataBuf[DATA_BUF_SZ];
 
 	// Status byte
-#define DEV_GOOD_MPLX115		0
+#define DEV_GOOD_MPL3115		0
 #define DEV_GOOD_FLASH			1
 #define DEV_GOOD_MPU6050		2
 uchar deviceStatus;
-
-	// MPL115A2 coefficients
-#if !defined(USING_MPL3115)
-int16_t a0, b1, b2, c12;
-#endif
 
 	// Flash memory
 uint16_t flashSize;			// size in 256-byte pages
 uint16_t flashStartPage;	// starting write page
 uint16_t flashPage;			// current write page indicator
 uint8_t flashByteCtr;		// current write byte counter within page
+
+int32_t altitude;
+int16_t temperature;
 
 
 //---------------------------
@@ -143,9 +132,9 @@ uint8_t readI2CRegister(uint8_t device, uint8_t reg)
 }
 
 
-uint8_t writeMPLx115Register(uint8_t reg, uint8_t val)
+uint8_t writeMPL3115Register(uint8_t reg, uint8_t val)
 {
-	if (i2c_start(MPLx115A2_DEVICE | I2C_WRITE) != 0) return 0;
+	if (i2c_start(MPL3115A2_DEVICE | I2C_WRITE) != 0) return 0;
 	i2c_write(reg);
 	i2c_write(val);
 	i2c_stop();
@@ -153,13 +142,13 @@ uint8_t writeMPLx115Register(uint8_t reg, uint8_t val)
 }
 
 
-uint8_t readMPLx115Register(uint8_t reg)
+uint8_t readMPL3115Register(uint8_t reg)
 {
 	uint8_t val;
 	
-	i2c_start_wait(MPLx115A2_DEVICE | I2C_WRITE);
+	i2c_start_wait(MPL3115A2_DEVICE | I2C_WRITE);
 	i2c_write(reg);
-	i2c_rep_start(MPLx115A2_DEVICE | I2C_READ);
+	i2c_rep_start(MPL3115A2_DEVICE | I2C_READ);
 	//i2c_readAck(); // dummy read
 	val = i2c_readNak();
 	i2c_stop();
@@ -168,90 +157,61 @@ uint8_t readMPLx115Register(uint8_t reg)
 }
 
 
-uint8_t initMPLx115(void)
-// Initialize the MPLx115A2 pressure sensor / altimeter, return 0 if bad comms
+uint8_t initMPL3115(void)
+// Initialize the MPL3115A2 pressure sensor / altimeter, return 0 if bad comms
 {
-#ifdef USING_MPL3115
-
 // Set to altimeter with an OSR = 128
-	if (!writeMPLx115Register(0x26, 0xB8)) return 0;
+	if (!writeMPL3115Register(0x26, 0xB8)) return 0;
 
 // Set user offset altitude (TODO: make a real offset, not a test!)
-	//if (!writeMPLx115Register(0x2D, 35)) return 0;
+	//if (!writeMPL3115Register(0x2D, 35)) return 0;
 
 // Enable data flags in PT_DATA_CFG
-	if (!writeMPLx115Register(0x13, 0x07)) return 0;
+	if (!writeMPL3115Register(0x13, 0x07)) return 0;
 
 // Start data collection
-	if (!writeMPLx115Register(0x26, 0xB9)) return 0;
+	if (!writeMPL3115Register(0x26, 0xB9)) return 0;
 	
 	// TEMP device check!
-	dataBuf[1] = readMPLx115Register(0x0C);
+	dataBuf[1] = readMPL3115Register(0x0C);
 	dataBuf[2] = 0xFF;
-
-#else
-
-	// Init comms
-	if (i2c_start(MPLx115A2_DEVICE | I2C_WRITE) != 0) return 0;
-	
-	// Read coefficients
-	i2c_write(MPL115A2_READCOEFFIRST);
-	i2c_rep_start(MPLx115A2_DEVICE | I2C_READ);
-	for (uchar coef=MPL115A2_READCOEFFIRST; coef<=MPL115A2_READCOEFLAST; coef++) {
-		dataBuf[coef - MPL115A2_READCOEFFIRST] = i2c_readAck();
-	}
-	
-	i2c_stop();
-	
-	a0  = (int16_t)((dataBuf[0] << 8) | dataBuf[1]);	// 3 fractional bits
-	b1  = (int16_t)((dataBuf[2] << 8) | dataBuf[3]);	// 13 fractional bits
-	b2  = (int16_t)((dataBuf[4] << 8) | dataBuf[5]);	// 14 fractional bits
-	c12 = (int16_t)((dataBuf[6] << 8) | dataBuf[7]);    // 9 dec pt zero pad
-
-#endif
 
 	return 1;	// device good
 }
 
 
-void startMPLx115Read(void)
-{
-#ifdef USING_MPL3115
+void waitForMPL3115Ready(void)
 // Check for data ready
+{
 // TODO: Add a timeout!
 	uint8_t status;
 	do {
-		status = readMPLx115Register(0x00);
+		status = readMPL3115Register(0x00);
 	} while ((status & 0x08) == 0);
-#else
-// Start ADC conversion on MPL115A2 (needs up to 3ms to complete)
-	i2c_start_wait(MPLx115A2_DEVICE | I2C_WRITE);
-	i2c_write(MPL115A2_STARTCONV);
-	i2c_write(0);
-	i2c_stop();
-#endif
 }
 
 
-int32_t readMPLx115Altitude(void)
-// Read data from MPLx115A2 and return altitude with 5-bit fractional part... (was pressure in kPa (with 4-bit fractional part))
+int32_t readMPL3115Altitude(void)
+// Read data from MPL3115A2 and return signed altitude including 4-bit fractional part
+//  32 bits = 0BB.B
 {
-#ifdef USING_MPL3115
-	uint8_t OUT_P_MSB, OUT_P_CSB, OUT_P_LSB;
-	int16_t res;
+	int32_t res = 0;
+	uint8_t *p = (uint8_t *)(&res);
 	
-	// Read OUT_P and OUT_T
-	OUT_P_MSB = readMPLx115Register(0x01);
-	OUT_P_CSB = readMPLx115Register(0x02);
-	OUT_P_LSB = readMPLx115Register(0x03);
-	//OUT_T_MSB = readMPLx115Register(0x04);
-	//OUT_T_LSB = readMPLx115Register(0x05);
+	waitForMPL3115Ready();
+
+	*(++p) = readMPL3115Register(0x01);
+	if (((*p) & 0x80) == 1) *(uint8_t *)(&res) = 0xFF;
+	*(++p) = readMPL3115Register(0x02);
+	*(++p) = readMPL3115Register(0x03);
+
+#if 0
 	dataBuf[3] = OUT_P_MSB;
 	dataBuf[4] = OUT_P_CSB;
 	dataBuf[5] = OUT_P_LSB;
 	
-	dataBuf[10] = readMPLx115Register(0x04);
-	dataBuf[11] = readMPLx115Register(0x05);
+	dataBuf[10] = readMPL3115Register(0x04);
+	dataBuf[11] = readMPL3115Register(0x05);
 	
 	dataBuf[7] = OUT_P_MSB;
 	dataBuf[8] = OUT_P_CSB;
@@ -270,98 +230,23 @@ int32_t readMPLx115Altitude(void)
 	else {
 		dataBuf[6] = 0;
 	}
-	
-	
-	res = (((uint16_t)OUT_P_MSB) << 13) & (((uint16_t)OUT_P_CSB) << 5) & (OUT_P_LSB >> 3);	// TODO: Check for negatives...this is 2s-complement data
-	return res;
-	
-#else
-
-	uint16_t Padc, Tadc;
-	int32_t c12x2, a1, a1x1, y1, a2x2, PComp;
-	
-	i2c_start_wait(MPLx115A2_DEVICE | I2C_WRITE);
-	i2c_write(0);
-	i2c_rep_start(MPLx115A2_DEVICE | I2C_READ);
-	Padc = (i2c_readAck() << 2) + (i2c_readAck() >> 6);
-	Tadc = (i2c_readAck() << 2) + (i2c_readNak() >> 6);
-	i2c_stop();
-
-	c12x2 = (((int32_t)c12) * Tadc) >> 11;	// c12x2 = c12 * Tadc
-	a1    = (int32_t)b1 + c12x2;			// a1    = b1  + c12x2
-	a1x1  = a1 * Padc;						// a1x1  = a1  * Padc
-	y1    = (((int32_t)a0) << 10) + a1x1;	// y1    = a0  + a1x1
-	a2x2  = (((int32_t)b2) * Tadc) >> 1;	// a2x2  = b2  * Tadc
-	PComp = (y1 + a2x2) >> 9;				// PComp = y1  + a2x2
-
-	return (int16_t)((((int32_t)PComp) * 1041) >> 14) + 800;		// TODO: Convert to altitude!
-
 #endif
+	
+	return res;
 }
 
 
-int16_t readMPLx115Temperature(void)
-// Read data from MPLx115A2 and return temperature in DegC
+int16_t readMPL3115Temperature(void)
+// Read data from MPL3115A2 and return signed temperature in DegC (with 4-bit fractional part)
+//  16 bits = B.B
 {
-#ifdef USING_MPL3115
-
-	uint8_t OUT_T_MSB, OUT_T_LSB;
 	int16_t res;
+	uint8_t *p = (uint8_t *)(&res);
 	
-	// Read OUT_P and OUT_T
-	OUT_T_MSB = readMPLx115Register(0x04);
-	OUT_T_LSB = readMPLx115Register(0x05);
-	dataBuf[3] = OUT_P_MSB;
-	dataBuf[4] = OUT_P_CSB;
-	dataBuf[5] = OUT_P_LSB;
-	
-	dataBuf[10] = readMPLx115Register(0x04);
-	dataBuf[11] = readMPLx115Register(0x05);
-	
-	dataBuf[7] = OUT_P_MSB;
-	dataBuf[8] = OUT_P_CSB;
-	dataBuf[9] = OUT_P_LSB;
-	if (OUT_P_MSB & 0x80) {
-		dataBuf[6] = 1;
-		if (dataBuf[9]-- == 0) {
-			if (dataBuf[8]-- == 0) {
-				dataBuf[7]--;
-			}
-		}
-		dataBuf[7] = ~dataBuf[7];
-		dataBuf[8] = ~dataBuf[8];
-		dataBuf[9] = ~dataBuf[9];
-	}
-	else {
-		dataBuf[6] = 0;
-	}
-	
-	
-	res = (((uint16_t)OUT_P_MSB) << 13) & (((uint16_t)OUT_P_CSB) << 5) & (OUT_P_LSB >> 3);	// TODO: Check for negatives...this is 2s-complement data
+	*(p) = readMPL3115Register(0x04);
+	*(++p) = readMPL3115Register(0x05);
+
 	return res;
-	
-#else
-
-	uint16_t Padc, Tadc;
-	int32_t c12x2, a1, a1x1, y1, a2x2, PComp;
-	
-	i2c_start_wait(MPLx115A2_DEVICE | I2C_WRITE);
-	i2c_write(0);
-	i2c_rep_start(MPLx115A2_DEVICE | I2C_READ);
-	Padc = (i2c_readAck() << 2) + (i2c_readAck() >> 6);
-	Tadc = (i2c_readAck() << 2) + (i2c_readNak() >> 6);
-	i2c_stop();
-
-	c12x2 = (((int32_t)c12) * Tadc) >> 11;	// c12x2 = c12 * Tadc
-	a1    = (int32_t)b1 + c12x2;			// a1    = b1  + c12x2
-	a1x1  = a1 * Padc;						// a1x1  = a1  * Padc
-	y1    = (((int32_t)a0) << 10) + a1x1;	// y1    = a0  + a1x1
-	a2x2  = (((int32_t)b2) * Tadc) >> 1;	// a2x2  = b2  * Tadc
-	PComp = (y1 + a2x2) >> 9;				// PComp = y1  + a2x2
-
-	return (int16_t)((((int32_t)PComp) * 1041) >> 14) + 800;		// TODO: Convert to altitude!
-
-#endif
 }
 
 
@@ -497,6 +382,12 @@ void endFlashWrite(void)
 }
 
 
+uint8_t resetDataPtr(void)
+// "Clears" memory by removing any saved data start pointer
+{
+	return 1;	// returns non-zero on success...
+}
+
 
 
 //---------------------------
@@ -506,16 +397,14 @@ void endFlashWrite(void)
 USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 // Responds to USB messages
 {
-	//int temp;
-	//uint16_t utemp;
-	//int16_t altitude;
-	
 	usbRequest_t *rq = (usbRequest_t *)data;
 	
 	// Respond to command in bRequest field
 	switch(rq->bRequest) {
 
-		case USB_STATUS:
+		case USB_CLEAR_MEMORY:
+			if (!resetDataPtr()) return 0;
+		case USB_STATUS:		// intentional fall-through
 			usbMsgPtr = (usbMsgPtr_t)(&deviceStatus);
 			return 1;
 
@@ -523,25 +412,16 @@ USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 			usbMsgPtr = (usbMsgPtr_t)dataBuf;
 			return DATA_BUF_SZ;
 
-		case USB_ALTITUDE:
-			startMPLx115Read();
-			#if !defined(USING_MPL3115)
-			_delay_ms(3);
-			#endif
-			/* altitude = */readMPLx115Altitude();
-			//usbMsgPtr = (usbMsgPtr_t)(&altitude);
-			//return sizeof(altitude);
-			usbMsgPtr = (usbMsgPtr_t)(dataBuf + 3);
-			return 3;
+		case USB_READ_ALTITUDE:
+			altitude = readMPL3115Altitude();
+			usbMsgPtr = (usbMsgPtr_t)(&altitude);
+			return sizeof(altitude);
 
-		case USB_TEMPERATURE:
-			startMPLx115Read();
-			#if !defined(USING_MPL3115)
-			_delay_ms(3);
-			#endif
-			/* altitude = */readMPLx115Temperature();
-			usbMsgPtr = (usbMsgPtr_t)(dataBuf + 3);
-			return 3;
+		case USB_READ_TEMPERATURE:
+			temperature = readMPL3115Temperature();
+			usbMsgPtr = (usbMsgPtr_t)(&temperature);
+			return sizeof(temperature);
+
 
 /*
 		case USB_DATA_WRITE: // modify reply buffer
@@ -570,7 +450,7 @@ int main(void)
 	uint16_t PACIFIER_OFF_TGT = HEARTBEAT_TICK / DATA_TICK;
 	uint16_t PACIFIER_ON_TGT = PACIFIER_OFF_TGT - (HEARTBEAT_ON_TIME / DATA_TICK);
 	uint16_t PACIFIER_FULL_TGT = HEARTBEAT_FULL_TIME / DATA_TICK;
-	int16_t altitude;
+	int32_t altitude;
 	
 #define CHECK_WRITE(b) { if (!memoryFull) memoryFull = writeFlashByte(b); }
 
@@ -608,7 +488,7 @@ int main(void)
 	
 // Initialize all bus devices
 	deviceStatus = 0;
-	deviceStatus |= initMPLx115() << DEV_GOOD_MPLX115;
+	deviceStatus |= initMPL3115() << DEV_GOOD_MPL3115;
 	deviceStatus |= initFlash() << DEV_GOOD_FLASH;
 	deviceStatus |= initMPU6050() << DEV_GOOD_MPU6050;
 	dataBuf[0] = deviceStatus;
@@ -646,13 +526,12 @@ int main(void)
 			if (usbConnectedLast) PORTD &= ~_BV(PORTD6); // turn status LED off immediately if just removed
 			
 			// Read altimeter
-			startMPLx115Read();
-			_delay_ms(3);  // maximum ADC conversion time
-			altitude = readMPLx115Altitude();
+			altitude = readMPL3115Altitude();
 			
 			// Write data to flash
-			CHECK_WRITE(((uint16_t)altitude) >> 8);
-			CHECK_WRITE(((uint16_t)altitude) & 0xFF);
+			CHECK_WRITE(*(unsigned char *)(&altitude+1));
+			CHECK_WRITE(*(unsigned char *)(&altitude+2));
+			CHECK_WRITE(*(unsigned char *)(&altitude+3));
 
 			_delay_ms(DATA_TICK);  // should instead wait for a clock tick, not delay a specified amount!
 			
