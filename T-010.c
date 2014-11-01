@@ -86,13 +86,15 @@ const uint8_t FLASH_CHIP_ERASE_CMD   = 0xC7;
 //-----------------------------
 	// USB messages from host
 #define USB_STATUS				0
-#define USB_DATA_DUMP			1
+#define USB_PAGE_DUMP			1
 #define USB_READ_ALTIMETER		2
 #define USB_FLASH_STATUS		3
 #define USB_CLEAR_MEMORY		4
 #define USB_FLASH_WRITE_TEST	5
 #define USB_FLASH_READ_TEST		6
-#define USB_IS_RAM_BUSY			7
+#define USB_IS_FLASH_BUSY		7
+#define USB_TEST				8
+#define USB_DATA_SIZE			9
 	// USB register configuration
 	// Configures USI to 3-wire master mode with overflow interrupt
 #define myUSICR  (_BV(USIWM0) | _BV(USICS1) | _BV(USICLK))
@@ -459,11 +461,24 @@ uint8_t writeFlashByte(uint8_t b)
 	return flash.full;
 }
 
-
+/*
 void endFlashWrite(void)
-// Ends a flash memory sequential write.
+// Ends a flash memory sequential write
 {
 	FLASH_CS_CLR;
+}
+*/
+
+void startFlashReadPage(uint16_t page)
+// Starts a sequential read at the beginning of a page
+{
+	FLASH_CS_CLR;
+	waitForFlashReady();
+	FLASH_CS_SET;
+	spiByte(FLASH_READ_DATA_CMD);
+	spiByte(page >> 8);		// page MSB
+	spiByte(page & 0xFF);	// page LSB
+	spiByte(0);				// byte 0
 }
 
 
@@ -505,8 +520,7 @@ void readLastFlashPage(void)
 	
 #endif
 
-	if (flash.page < 1) flash.page = 1;
-	if (flash.page == 0xFFFF) flash.page = 1;  // uninitialized case
+	if (flash.page == 0xFFFF) flash.page = 0;  // uninitialized case
 	if (flash.page > flash.size) flash.full = 1;
 }
 
@@ -514,7 +528,7 @@ void readLastFlashPage(void)
 uint8_t resetDataPtr(void)
 // "Clears" memory by removing any saved data start pointer
 {
-	flash.page = 1;
+	flash.page = 0;
 	writeFlashPageNumber(flash.page);
 	flash.full = 0;
 	flash.byteCtr = 0;
@@ -528,7 +542,7 @@ uint8_t resetDataPtr(void)
 //  USB INTERFACE FUNCTIONS
 //---------------------------
 
-USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
+USB_PUBLIC usbMsgLen_t usbFunctionSetup(uchar data[8])
 // Responds to USB messages
 {
 	uchar i;
@@ -543,8 +557,9 @@ USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 			usbMsgPtr = (usbMsgPtr_t)(&deviceStatus);
 			return 1;
 
-		case USB_DATA_DUMP:
-		// Send all data in buffer to host
+		case USB_TEST:
+		// Currently just dumps all data currently in the general
+		//  purpose buffer to the host
 			usbMsgPtr = (usbMsgPtr_t)dataBuf;
 			return DATA_BUF_SZ;
 
@@ -591,14 +606,42 @@ USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 			usbMsgPtr = (usbMsgPtr_t)(dataBuf+10);
 			return 4;
 			
-		case USB_IS_RAM_BUSY:
+		case USB_IS_FLASH_BUSY:
 		// Checks whether flash RAM is busy (typically because it's doing a chip erase)
 			dataBuf[15] = isFlashBusy();
 			usbMsgPtr = (usbMsgPtr_t)(dataBuf+15);
 			return 1;
+			
+		case USB_DATA_SIZE:
+		// Returns size of data stored in flash RAM in 256-byte pages
+			usbMsgPtr = (usbMsgPtr_t)(&flash.page);
+			return sizeof(flash.page);
+			
+		case USB_PAGE_DUMP:
+		// Sends specified page of data to the host (page number in wIndex)
+			startFlashReadPage(rq->wIndex.word);
+			flash.byteCtr = 0;
+			return USB_NO_MSG;
  	}
 
 	return 0; // unhandled message
+}
+
+
+USB_PUBLIC uchar usbFunctionRead(uchar *data, uchar len)
+{
+	uchar i;
+
+	for (i=0; i<len; i++) {
+		data[i] = spiByte(0);
+		if (++flash.byteCtr == 0) {
+			i++;
+			FLASH_CS_CLR;
+			break;
+		}
+	}
+	
+	return i;
 }
 
 
@@ -669,7 +712,7 @@ int main(void)
 
 // Initialize flash memory
 	readLastFlashPage();
-	if (flash.page > 1) flash.page++;  // start at page following last page used (unless memory is clear)
+	if (flash.page != 0) flash.page++;  // start at page following last page used (unless memory is clear)
 	startFlashWrite(flash.page);
 	
 // Take initial altimeter data point

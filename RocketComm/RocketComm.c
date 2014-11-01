@@ -13,13 +13,15 @@
 
 
 #define USB_STATUS				0
-#define USB_DATA_DUMP			1
+#define USB_PAGE_DUMP			1
 #define USB_READ_ALTIMETER		2
 #define USB_FLASH_STATUS		3
 #define USB_CLEAR_MEMORY		4
 #define USB_FLASH_WRITE_TEST	5
 #define USB_FLASH_READ_TEST		6
-#define USB_IS_RAM_BUSY			7
+#define USB_IS_FLASH_BUSY		7
+#define USB_TEST				8
+#define USB_DATA_SIZE			9
 
 
 #define DEV_GOOD_MPLX115	0
@@ -190,6 +192,7 @@ int usage(char *sz, usb_dev_handle *handle)
 
 int main(int argc, char **argv)
 {
+	FILE *outfile;
     usb_dev_handle *handle = NULL;
     int nBytes = -1;
 	int i, pages, pages_used;
@@ -217,14 +220,17 @@ int main(int argc, char **argv)
         return 0;
     }
 
-// First, check whether RAM is busy
-    nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
-        USB_IS_RAM_BUSY, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
-	if (nBytes != 1) puts("Unexpected buffer size return for RAM busy check!");
-	if (buffer[0]) {
-		puts("Device RAM is currently busy, please stand by!");
-		usb_close(handle);
-		return 0;
+// First, check whether RAM is busy (if it will be used by this call)
+	if ((strcmp(argv[1], "clear") == 0) || (strcmp(argv[1], "dump") == 0) ||
+		(strcmp(argv[1], "write") == 0) || (strcmp(argv[1], "retrieve") == 0)) {
+		nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
+			USB_IS_FLASH_BUSY, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
+		if (nBytes != 1) puts("Unexpected buffer size return for flash RAM busy check!");
+		if (buffer[0]) {
+			puts("Device flash RAM is currently busy, please stand by!");
+			usb_close(handle);
+			return 0;
+		}
 	}
 
 // Check command line argument
@@ -263,7 +269,7 @@ int main(int argc, char **argv)
     }
 	else if (strcmp(argv[1], "test") == 0) {
         nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
-            USB_DATA_DUMP, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
+            USB_TEST, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
         printf("Got %d bytes:\n", nBytes);
 		for (i=0; i<nBytes; i++)
 			printf("  %2d: %02x\n", i, buffer[i]);
@@ -282,8 +288,25 @@ int main(int argc, char **argv)
 			puts("Must specify filename on the command line!\n");
 		}
 		else {
-			nBytes = 0;
-			printf("Receiving %d bytes of data", nBytes);
+			fopen_s(&outfile, argv[2], "wb");
+			if (!outfile) {
+				printf("Error creating file \"%s\"!\n", argv[2]);
+			}
+			else {
+				nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
+					USB_DATA_SIZE, 0, 0, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
+				pages = *((short *)buffer);
+				printf("Receiving %d.%02d KB of data", pages / 4, 25 * (pages % 4));
+				for (i=0; i<pages; i++) {
+					nBytes = usb_control_msg(handle, USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_ENDPOINT_IN, 
+						USB_PAGE_DUMP, 0, i, (char *)buffer, sizeof(buffer), USB_TIMEOUT);
+					if (nBytes != 256) printf("\nWARNING: Short page received (len=%d)!", nBytes);
+					fwrite(buffer, 1, nBytes, outfile);
+					printf(".");
+				}
+				puts("\nDone!");
+				fclose(outfile);
+			}
 		}
     }
 	else if (strcmp(argv[1], "write") == 0) {
