@@ -34,12 +34,14 @@ Do this by executing (on a factory-fresh IC):
 //  GENERAL CONFIGURATION
 //-------------------------
 	// Data loop times in milliseconds
-#define DATA_TICK              50
+#define DATA_TICK              25			// 50 Hz data loop
 #define HEARTBEAT_TICK       2000
 #define HEARTBEAT_ON_TIME     100
 #define HEARTBEAT_FULL_TIME   500
-	// Altimeter setting
-const uint8_t MPL3115A2_CFG = 0xB8;		// contents of CTRL_REG1
+	// Altimeter configuration
+		// Contents of CTRL_REG1
+		// OSR = 8 (min time between samples = 18ms), altitude mode
+const uint8_t MPL3115A2_CFG = 0x98;
 
 
 //-----------------------------
@@ -68,9 +70,12 @@ const uint8_t MPU6050_DEVICE_ID		= 0x68;
 const uint16_t FLASH_JEDEC_ID = 0x0140;
 
 const uint8_t FLASH_PAGE_PGM_CMD     = 0x02;
+const uint8_t FLASH_READ_DATA_CMD    = 0x03;
 const uint8_t FLASH_READ_SR1_CMD     = 0x05;
 const uint8_t FLASH_WRITE_ENABLE_CMD = 0x06;
-const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
+const uint8_t FLASH_SECTOR_ERASE_CMD = 0x20;
+const uint8_t FLASH_JEDEC_ID_CMD     = 0x9F;
+const uint8_t FLASH_CHIP_ERASE_CMD   = 0xC7;
 
 #define FLASH_CS_SET  (PORTB &= ~_BV(PORTB4))		// set chip select (low is set)
 #define FLASH_CS_CLR  (PORTB |= _BV(PORTB4))		// clear chip select (high is clear)
@@ -83,7 +88,11 @@ const uint8_t FLASH_JEDEC_ID_CMD     = 0x9f;
 #define USB_STATUS				0
 #define USB_DATA_DUMP			1
 #define USB_READ_ALTIMETER		2
+#define USB_FLASH_STATUS		3
 #define USB_CLEAR_MEMORY		4
+#define USB_FLASH_WRITE_TEST	5
+#define USB_FLASH_READ_TEST		6
+#define USB_IS_RAM_BUSY			7
 	// USB register configuration
 	// Configures USI to 3-wire master mode with overflow interrupt
 #define myUSICR  (_BV(USIWM0) | _BV(USICS1) | _BV(USICLK))
@@ -111,10 +120,13 @@ static uchar dataBuf[DATA_BUF_SZ];
 #define temperature_ptr			(dataBuf + 4)		// 2 bytes
 
 	// Flash memory
-uint16_t flashSize;			// size in 256-byte pages
-uint16_t flashStartPage;	// starting write page
-uint16_t flashPage;			// current write page indicator
-uint8_t flashByteCtr;		// current write byte counter within page
+static struct {
+	uint16_t size;			// size in 256-byte pages
+	uint16_t startPage;		// starting write page
+	uint16_t page;			// current write page indicator
+	uint8_t  byteCtr;		// current write byte counter within page
+	uint8_t  full;			// memory full flag
+} flash;
 
 
 
@@ -177,23 +189,31 @@ uint8_t initMPL3115(void)
 // Check that expected device is present
 	if (readMPL3115Register(MPL3115A2_REG_WHOAMI) != MPL3115A2_DEVICE_ID) return 0;
 
-// Set to altimeter with an OSR = 128
+// Set altimeter configuration
 	if (!writeMPL3115Register(MPL3115A2_REG_CTRL_REG1, MPL3115A2_CFG)) return 0;
 
 // Enable data flags in PT_DATA_CFG
 	if (!writeMPL3115Register(MPL3115A2_REG_PT_DATA_CFG, 0x07)) return 0;
 
 // Start data collection
-	if (!writeMPL3115Register(MPL3115A2_REG_CTRL_REG1, MPL3115A2_CFG | 1)) return 0;
+//	if (!writeMPL3115Register(MPL3115A2_REG_CTRL_REG1, MPL3115A2_CFG | 1)) return 0;
 	
 	return 1;	// device good
 }
 
 
-void waitForMPL3115Ready(void)
-// Check for data ready
+void startMPL3115OneShot(void)
+// Starts a one-shot data acquisition
 {
-// TODO: Add a timeout!
+	readMPL3115Register(MPL3115A2_REG_CTRL_REG1);							// auto-clear one-shot bit
+	writeMPL3115Register(MPL3115A2_REG_CTRL_REG1, MPL3115A2_CFG | 0x02);	// set one-shot bit
+}
+
+
+void waitForMPL3115NewData(void)
+// Check for new data ready
+{
+// TODO: Add a timeout?
 	uint8_t status;
 	do {
 		status = readMPL3115Register(MPL3115A2_REG_STATUS);
@@ -205,11 +225,12 @@ void readMPL3115(void)
 // Read altitude and temperature data from MPL3115A2 into data buffer
 //  Altitude:	 24 bits = BB.B  (8-bit fractional part) (meters MSL)
 //  Temperature: 12 bits =  B.B  (4-bit fractional part) (degrees C)
-// TODO: Consider one "long" 5-byte read instead of 5 separate reads!
 {
 	uint8_t *p = altitude_ptr;
 	
-	waitForMPL3115Ready();
+	waitForMPL3115NewData();
+
+#if 0
 
 // Read altitude
 	*(p++) = readMPL3115Register(MPL3115A2_REG_OUT_P_MSB);
@@ -219,6 +240,19 @@ void readMPL3115(void)
 // Read temperature
 	*(p++) = readMPL3115Register(MPL3115A2_REG_OUT_T_MSB);
 	*p = readMPL3115Register(MPL3115A2_REG_OUT_T_LSB);
+	
+#else
+
+	uchar i;
+	
+	i2c_start_wait(MPL3115A2_DEVICE | I2C_WRITE);
+	i2c_write(MPL3115A2_REG_OUT_P_MSB);
+	i2c_rep_start(MPL3115A2_DEVICE | I2C_READ);
+	for (i=0; i<4; i++) *(p++) = i2c_readAck();
+	*p = i2c_readNak();
+	i2c_stop();
+
+#endif
 }
 
 
@@ -262,9 +296,9 @@ uint8_t initFlash(void)
 		return 0;	}	
 	// Read flash size
 	sz = spiByte(0) - 0x14;
-	flashSize = sz * 2;
-	if (flashSize == 6) flashSize = 8;
-	flashSize <<= 12; // * 4096
+	flash.size = sz * 2;
+	if (flash.size == 6) flash.size = 8;
+	flash.size <<= 12; // * 4096
 
 	FLASH_CS_CLR;	
 	return 1;	// device good
@@ -299,28 +333,109 @@ void waitForFlashReady(void)
 }
 
 
-void startFlashWritePage(uint16_t page)
-// Opens a flash memory page for writing. Called automatically for sequential writes.
+void enableFlashWrites(void)
+// Enables writing to the flash; must be called before each new write operation
 {
 	FLASH_CS_SET;
 	spiByte(FLASH_WRITE_ENABLE_CMD);
 	FLASH_CS_CLR;
 	_delay_us(20); // TODO: check length of delay
-	
+}
+
+
+void eraseFlashSector(uint32_t addr)
+// Erases the 4-KB sector containing the given address
+{
+	waitForFlashReady();
+	enableFlashWrites();
+	FLASH_CS_SET;
+	spiByte(FLASH_SECTOR_ERASE_CMD);
+	spiByte((addr >> 16) & 0xFF);
+	spiByte((addr >> 8) & 0xFF);
+	spiByte(addr & 0xFF);
+	FLASH_CS_CLR;
+}
+
+
+void eraseFlash(void)
+// Erases the entire flash chip (takes 30-256 seconds to complete!)
+{
+	waitForFlashReady();
+	enableFlashWrites();
+	FLASH_CS_SET;
+	spiByte(FLASH_CHIP_ERASE_CMD);
+	FLASH_CS_CLR;
+}
+
+
+void writeFlashPageNumber(uint16_t page)
+// Updates page number
+{
+#if 0
+// (stored at start of page 0 so it survives power cycles)
+	eraseFlashSector(0);
+	waitForFlashReady();
+	enableFlashWrites();
+	FLASH_CS_SET;
+	spiByte(FLASH_PAGE_PGM_CMD);
+	spiByte(0);	// page 0 (MSB)
+	spiByte(0);	// page 0 (LSB)
+	spiByte(0); // byte 0
+	spiByte(page >> 8);
+	spiByte(page & 0xFF);
+	FLASH_CS_CLR;
+#else
+// (stored in first two bytes of EEPROM so it survives power cycles)
+	/* Wait for completion of previous write */
+	while(EECR & (1<<EEPE));
+	/* Set Programming mode */
+	EECR = (0<<EEPM1)|(0<<EEPM0);
+	/* Set up address and data registers */
+	EEAR = 0;
+	EEDR = page & 0xFF;
+	/* Write logical one to EEMPE */
+	EECR |= (1<<EEMPE);
+	/* Start eeprom write by setting EEPE */
+	EECR |= (1<<EEPE);
+
+	/* Wait for completion of previous write */
+	while(EECR & (1<<EEPE));
+	/* Set Programming mode */
+	EECR = (0<<EEPM1)|(0<<EEPM0);
+	/* Set up address and data registers */
+	EEAR = 1;
+	EEDR = page >> 8;
+	/* Write logical one to EEMPE */
+	EECR |= (1<<EEMPE);
+	/* Start eeprom write by setting EEPE */
+	EECR |= (1<<EEPE);
+
+#endif
+}
+
+
+void startFlashWritePage(uint16_t page)
+// Opens a flash memory page for writing. Called automatically for sequential writes.
+{
+	writeFlashPageNumber(page);
+
+// Open the indicated page for writing
+	waitForFlashReady();
+	enableFlashWrites();
 	FLASH_CS_SET;
 	spiByte(FLASH_PAGE_PGM_CMD);
 	spiByte(page >> 8);
 	spiByte(page & 0xFF);
-	spiByte(0);
+	spiByte(0);  // start at byte 0
 }
 
 
 void startFlashWrite(uint16_t page)
 // Begins a flash memory sequential write.
 {
-	flashPage = page;
-	flashStartPage = page;
-	flashByteCtr = 0;
+	flash.page = page;
+	flash.startPage = page;
+	flash.byteCtr = 0;
 	startFlashWritePage(page);
 }
 
@@ -330,16 +445,18 @@ uint8_t writeFlashByte(uint8_t b)
 // Must have called startFlashWrite() before calling this function.
 // Returns 1 if we just filled the last memory page; 0 if all OK.
 {
-	spiByte(b);
-	if (flashByteCtr++ == 0) {
-		FLASH_CS_CLR;
-		waitForFlashReady();
-		flashPage++;
-		if (flashPage > flashSize) flashPage = 0;
-		if (flashPage == flashStartPage) return 1;
-		startFlashWritePage(flashPage);
+	if (!flash.full) {
+		spiByte(b);
+		if (++flash.byteCtr == 0) {
+			FLASH_CS_CLR;
+			flash.page++;
+//			if (flash.page > flash.size) flash.page = 0;
+//			if (flash.page == flash.startPage) flash.full = 1;
+			if (flash.page > flash.size) flash.full = 1;  // no wrap-around for now...
+			else startFlashWritePage(flash.page);
+		}
 	}
-	return 0;
+	return flash.full;
 }
 
 
@@ -350,9 +467,58 @@ void endFlashWrite(void)
 }
 
 
+void readLastFlashPage(void)
+// Reads last page used
+{
+#if 0
+// ...from the flash memory (survives power cycle)
+	flash.full = 0;
+	waitForFlashReady();
+	FLASH_CS_SET;
+	spiByte(FLASH_READ_DATA_CMD);
+	spiByte(0);	// page 0 (MSB)
+	spiByte(0);	// page 0 (LSB)
+	spiByte(0); // byte 0
+	flash.page = (spiByte(0) << 8) + spiByte(0);
+	FLASH_CS_CLR;
+#else
+// ...from the EEPROM (survives power cycle)
+	flash.full = 0;
+	
+	/* Wait for completion of previous write */
+	while(EECR & (1<<EEPE));
+	/* Set up address register */
+	EEAR = 0;
+	/* Start eeprom read by writing EERE */
+	EECR |= (1<<EERE);
+	/* Return data from data register */
+	flash.page = EEDR;
+	
+	/* Wait for completion of previous write */
+	while(EECR & (1<<EEPE));
+	/* Set up address register */
+	EEAR = 1;
+	/* Start eeprom read by writing EERE */
+	EECR |= (1<<EERE);
+	/* Return data from data register */
+	flash.page |= ((uint16_t)EEDR) << 8;
+	
+#endif
+
+	if (flash.page < 1) flash.page = 1;
+	if (flash.page == 0xFFFF) flash.page = 1;  // uninitialized case
+	if (flash.page > flash.size) flash.full = 1;
+}
+
+
 uint8_t resetDataPtr(void)
 // "Clears" memory by removing any saved data start pointer
 {
+	flash.page = 1;
+	writeFlashPageNumber(flash.page);
+	flash.full = 0;
+	flash.byteCtr = 0;
+	eraseFlash();
 	return 1;	// returns non-zero on success...
 }
 
@@ -365,6 +531,7 @@ uint8_t resetDataPtr(void)
 USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 // Responds to USB messages
 {
+	uchar i;
 	usbRequest_t *rq = (usbRequest_t *)data;
 	
 	// Respond to command in bRequest field
@@ -376,23 +543,59 @@ USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 			usbMsgPtr = (usbMsgPtr_t)(&deviceStatus);
 			return 1;
 
-		case USB_DATA_DUMP: // send all data in buffer to PC
+		case USB_DATA_DUMP:
+		// Send all data in buffer to host
 			usbMsgPtr = (usbMsgPtr_t)dataBuf;
 			return DATA_BUF_SZ;
 
 		case USB_READ_ALTIMETER:
+			startMPL3115OneShot();
 			readMPL3115();
 			usbMsgPtr = (usbMsgPtr_t)(altitude_ptr);
 			return 5;
-
-/*
-		case USB_DATA_WRITE: // modify reply buffer
-			replyBuf[7] = rq->wValue.bytes[0];
-			replyBuf[8] = rq->wValue.bytes[1];
-			replyBuf[9] = rq->wIndex.bytes[0];
-			replyBuf[10] = rq->wIndex.bytes[1];
+			
+		case USB_FLASH_STATUS:
+			usbMsgPtr = (usbMsgPtr_t)(&flash);
+			return sizeof(flash);
+			
+		case USB_FLASH_WRITE_TEST:
+		// Write test data at byte 64 on page 0
+			FLASH_CS_CLR;
+			eraseFlashSector(0);
+			waitForFlashReady();
+			enableFlashWrites();
+			FLASH_CS_SET;
+			spiByte(FLASH_PAGE_PGM_CMD);
+			spiByte(0);	// page 0 (MSB)
+			spiByte(0);	// page 0 (LSB)
+			spiByte(64); // byte 64
+			spiByte(rq->wValue.bytes[0]);
+			spiByte(rq->wValue.bytes[1]);
+			spiByte(rq->wIndex.bytes[0]);
+			spiByte(rq->wIndex.bytes[1]);
+			FLASH_CS_CLR;
 			return 0;
-*/
+		
+		case USB_FLASH_READ_TEST:
+		// Read test data from byte 64 on page 0 and send to host
+			FLASH_CS_CLR;
+			waitForFlashReady();
+			FLASH_CS_SET;
+			spiByte(FLASH_READ_DATA_CMD);
+			spiByte(0);	// page 0 (MSB)
+			spiByte(0);	// page 0 (LSB)
+			spiByte(64); // byte 64
+			for (i=0; i<4; i++)
+				dataBuf[i+10] = spiByte(0);
+			FLASH_CS_CLR;
+			usbMsgPtr = (usbMsgPtr_t)(dataBuf+10);
+			return 4;
+			
+		case USB_IS_RAM_BUSY:
+		// Checks whether flash RAM is busy (typically because it's doing a chip erase)
+			dataBuf[15] = isFlashBusy();
+			usbMsgPtr = (usbMsgPtr_t)(dataBuf+15);
+			return 1;
  	}
 
 	return 0; // unhandled message
@@ -406,7 +609,7 @@ USB_PUBLIC uchar usbFunctionSetup(uchar data[8])
 
 int main(void)
 {
-	uchar i, memoryFull;
+	uchar i;
 	uint16_t pacifier = 0;
 	uchar usbConnected, usbConnectedLast = 0;
 	uchar *p;
@@ -414,8 +617,6 @@ int main(void)
 	uint16_t PACIFIER_ON_TGT = PACIFIER_OFF_TGT - (HEARTBEAT_ON_TIME / DATA_TICK);
 	uint16_t PACIFIER_FULL_TGT = HEARTBEAT_FULL_TIME / DATA_TICK;
 	
-#define CHECK_WRITE(b) { if (!memoryFull) memoryFull = writeFlashByte(b); }
-
 // Enable 1 sec watchdog timer
 	wdt_enable(WDTO_1S);
 
@@ -453,7 +654,7 @@ int main(void)
 	deviceStatus |= initMPL3115() << DEV_GOOD_MPL3115;
 	deviceStatus |= initFlash() << DEV_GOOD_FLASH;
 	deviceStatus |= initMPU6050() << DEV_GOOD_MPU6050;
-	deviceStatus |= flashSize >> 8;		// store size of flash RAM (in MB) to top 3 bits of status byte
+	deviceStatus |= flash.size >> 8;		// store size of flash RAM (in MB) to top 3 bits of status byte
 
 // Initialize USB
 	// TODO: Check whether this is working as expected for start-up when not connected to USB
@@ -465,10 +666,14 @@ int main(void)
 	}
 	usbDeviceConnect();
 	sei(); // Enable interrupts after re-enumeration
+
+// Initialize flash memory
+	readLastFlashPage();
+	if (flash.page > 1) flash.page++;  // start at page following last page used (unless memory is clear)
+	startFlashWrite(flash.page);
 	
-	memoryFull = 0;
-	startFlashWrite(0);		// temp -- starts at beginning of flash whenever turned on
-							// TODO: come up with something more intelligent...
+// Take initial altimeter data point
+	startMPL3115OneShot();
 
 // Main loop
 	while (1) {
@@ -485,20 +690,26 @@ int main(void)
 		
 		// If NOT connected to USB, collect data (and flash status light as heartbeat)
 		else {
-			if (usbConnectedLast) PORTD &= ~_BV(PORTD6); // turn status LED off immediately if just removed
+			if (usbConnectedLast) {
+				PORTD &= ~_BV(PORTD6); // turn status LED off immediately if just removed
+				pacifier = 0;
+				startMPL3115OneShot();
+			}
 			
 			// Read altimeter
 			readMPL3115();
+			startMPL3115OneShot();
 			
 			// Write data to flash (altitude and temperature)
+			// TODO: Consider compacting into only 4 bytes (because these data are 20-bit and 12-bit, respectively)
 			p = altitude_ptr;
-			for (i=0; i<5; i++) CHECK_WRITE(*(p++));
+			for (i=0; i<5; i++) writeFlashByte(*(p++));
 
 			_delay_ms(DATA_TICK);  // should instead wait for a clock tick, not delay a specified amount!
 			
 			// Heartbeat
 			pacifier++;
-			if (memoryFull) {
+			if (flash.full) {
 				// Flash quickly if the memory is filled
 				if (pacifier > PACIFIER_FULL_TGT) {
 					PIND |= _BV(PORTD6); // toggle status LED
