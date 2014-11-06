@@ -245,7 +245,7 @@ void readMPL3115(void)
 	
 #else
 
-	uchar i;
+	uint8_t i;
 	
 	i2c_start_wait(MPL3115A2_DEVICE | I2C_WRITE);
 	i2c_write(MPL3115A2_REG_OUT_P_MSB);
@@ -652,7 +652,7 @@ USB_PUBLIC uchar usbFunctionRead(uchar *data, uchar len)
 
 int main(void)
 {
-	uchar i;
+	uint8_t i;
 	uint16_t pacifier = 0;
 	uchar usbConnected, usbConnectedLast = 0;
 	uchar *p;

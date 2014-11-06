@@ -196,6 +196,7 @@ int main(int argc, char **argv)
     usb_dev_handle *handle = NULL;
     int nBytes = -1;
 	int i, pages, pages_used;
+	short alt;
     unsigned char buffer[256];
 	double degC, degF;
 
@@ -259,7 +260,9 @@ int main(int argc, char **argv)
 		debug_byte_dump(nBytes, buffer);
 		if (nBytes != 5) puts("Unexpected buffer size return!");
 		else {
-			printf("Altitude = %d.%04d meters\n", (buffer[0] << 8) + buffer[1], BIT_TRUE(buffer[2],7)*5000 +
+			alt = (buffer[0] << 8) + buffer[1];
+			if (alt < 0) buffer[2] = ~buffer[2];
+			printf("Altitude = %d.%04d meters\n", alt, BIT_TRUE(buffer[2],7)*5000 +
 				BIT_TRUE(buffer[2],6)*2500 + BIT_TRUE(buffer[2],5)*1250 + BIT_TRUE(buffer[2],4)*625);
 			degC = buffer[3] + BIT_TRUE(buffer[4],7)*0.5 + BIT_TRUE(buffer[4],6)*0.25 +
 				BIT_TRUE(buffer[4],5)*0.125 + BIT_TRUE(buffer[4],4)*0.0625;
